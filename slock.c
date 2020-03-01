@@ -18,6 +18,7 @@
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <Imlib2.h>
 
 #include "arg.h"
 #include "util.h"
@@ -37,7 +38,7 @@ struct lock
 	int screen;
 	Window root, win;
 	Pixmap pmap;
-	Pixmap pix;
+	Pixmap imgpix;
 	unsigned long colors[NUMCOLS];
 };
 
@@ -135,7 +136,7 @@ gethash(void)
 
 static void
 readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
-	   const char *hash)
+	   const char *hash, const char *failBgPath)
 {
 	XRRScreenChangeNotifyEvent *rre;
 	char buf[32], passwd[256], *inputhash;
@@ -148,6 +149,33 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	running = 1;
 	failure = 0;
 	oldc = INIT;
+
+	if (!!strcmp(failBgPath, ""))
+	{
+		Imlib_Image img = imlib_load_image(failBgPath);
+		if (!img)
+		{
+			fprintf(stderr, "Unable to load image\n");
+			exit(1);
+		}
+		imlib_context_set_image(img);
+
+		int width = imlib_image_get_width();
+		int height = imlib_image_get_height();
+
+		for (screen = 0; screen < nscreens; screen++)
+		{
+			Pixmap pix = XCreatePixmap(dpy, locks[screen]->win, width, height,
+									   DefaultDepth(dpy, screen));
+
+			imlib_context_set_display(dpy);
+			imlib_context_set_visual(DefaultVisual(dpy, screen));
+			imlib_context_set_colormap(DefaultColormap(dpy, screen));
+			imlib_context_set_drawable(pix);
+			imlib_render_image_on_drawable(0, 0);
+			locks[screen]->imgpix = pix;
+		}
+	}
 
 	while (running && !XNextEvent(dpy, &ev))
 	{
@@ -207,10 +235,20 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			{
 				for (screen = 0; screen < nscreens; screen++)
 				{
-					XSetWindowBackground(dpy,
-											locks[screen]->win,
-											locks[screen]->colors[color]);
-					XClearWindow(dpy, locks[screen]->win);
+					if (color == FAILED && locks[screen]->imgpix)
+					{
+						XSetWindowBackgroundPixmap(dpy,
+												   locks[screen]->win,
+												   locks[screen]->imgpix);
+						XClearWindow(dpy, locks[screen]->win);
+					}
+					else
+					{
+						XSetWindowBackground(dpy,
+											 locks[screen]->win,
+											 locks[screen]->colors[color]);
+						XClearWindow(dpy, locks[screen]->win);
+					}
 				}
 				oldc = color;
 			}
@@ -232,6 +270,15 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			for (screen = 0; screen < nscreens; screen++)
 				XRaiseWindow(dpy, locks[screen]->win);
 	}
+
+	if (!!strcmp(failBgPath, ""))
+	{
+		for (screen = 0; screen < nscreens; screen++)
+		{
+			XFreePixmap(dpy, locks[screen]->imgpix);
+		}
+		imlib_free_image();
+	}
 }
 
 static struct lock *
@@ -244,7 +291,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	XSetWindowAttributes wa;
 	Cursor invisible;
 
-	if (dpy == NULL || screen < 0 || !(lock = malloc(sizeof(struct lock))))
+	if (dpy == NULL || screen < 0 || !(lock = calloc(1, sizeof(struct lock))))
 		return NULL;
 
 	lock->screen = screen;
@@ -321,7 +368,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 static void
 usage(void)
 {
-	die("usage: slock [-v] [cmd [arg ...]]\n");
+	die("usage: slock [-vb] [cmd [arg ...]]\n");
 }
 
 int main(int argc, char **argv)
@@ -335,12 +382,22 @@ int main(int argc, char **argv)
 	const char *hash;
 	Display *dpy;
 	int s, nlocks, nscreens;
+	const char *failImgPath = "";
 
 	ARGBEGIN
 	{
 	case 'v':
 		fprintf(stderr, "slock-" VERSION "\n");
 		return 0;
+	case 'b':
+		argc--;
+		argv++;
+		if (argc)
+		{
+			failImgPath = argv[0];
+		}
+		brk_ = 1;
+		break;
 	default:
 		usage();
 	}
@@ -415,7 +472,8 @@ int main(int argc, char **argv)
 	}
 
 	/* everything is now blank. Wait for the correct password */
-	readpw(dpy, &rr, locks, nscreens, hash);
+	readpw(dpy, &rr, locks, nscreens, hash, failImgPath);
+	XCloseDisplay(dpy);
 
 	return 0;
 }
